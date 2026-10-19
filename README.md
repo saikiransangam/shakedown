@@ -1,5 +1,9 @@
 # shakedown
 
+[![CI](https://github.com/saikiransangam/shakedown/actions/workflows/ci.yml/badge.svg)](https://github.com/saikiransangam/shakedown/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/saikiransangam/shakedown.svg)](https://pkg.go.dev/github.com/saikiransangam/shakedown)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Find out *why* an API is unreliable, not just that it is.**
 
 Most load testers answer "how many requests per second can it take?". That is
@@ -611,8 +615,13 @@ mock server. The fault-injecting *proxy* — breaking a service you did not writ
 make build    # ./shakedown
 make test     # go test -race ./...
 make check    # fmt, vet, test
+make cover    # per-package coverage
 make demo     # start a flaky API, hit it, shut it down
 ```
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), which
+documents the measurement traps worth knowing before touching the request
+path.
 
 ## License
 

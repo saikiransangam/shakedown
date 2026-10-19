@@ -226,9 +226,7 @@ func writeFindings(w io.Writer, st style, findings []Finding) {
 	if len(findings) == 0 {
 		return
 	}
-	sort.SliceStable(findings, func(i, j int) bool {
-		return findings[i].Severity > findings[j].Severity
-	})
+	SortFindings(findings)
 
 	fmt.Fprintf(w, "\n%s\n", st.bold("Diagnosis"))
 	for _, f := range findings {

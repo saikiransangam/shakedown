@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/saikiransangam/shakedown/metrics"
@@ -62,7 +63,22 @@ func Diagnose(s *metrics.Summary) []Finding {
 				"or inject faults with `shakedown mock --profile brownout` to see what failure looks like.", s.Concurrency),
 		})
 	}
+
+	SortFindings(findings)
 	return findings
+}
+
+// SortFindings orders findings most severe first, preserving the order rules
+// ran in within a severity.
+//
+// The ordering has to be applied to the data rather than left to the renderer:
+// the rules run in a fixed sequence that has nothing to do with how serious
+// their findings turn out to be, so a severe conclusion from a late rule would
+// otherwise be buried under a mild one from an early rule.
+func SortFindings(findings []Finding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		return findings[i].Severity > findings[j].Severity
+	})
 }
 
 func diagnoseConnectivity(s *metrics.Summary) []Finding {

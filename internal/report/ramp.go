@@ -160,5 +160,6 @@ func diagnoseRamp(result *ramp.Result, a ramp.Analysis) []Finding {
 		})
 	}
 
+	SortFindings(findings)
 	return findings
 }
