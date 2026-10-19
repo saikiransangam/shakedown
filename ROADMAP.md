@@ -13,17 +13,21 @@ concept it implements.
 - [x] Diagnosis rules that say what a pattern usually means
 - [x] Fault-injecting mock API with profiles, including TCP resets and saturation
 
-## Step 2: ramp — find the knee
+## Done — step 2: ramp, find the knee
 
 A single run at one concurrency level tells you how the service behaves *there*.
 The useful question is where it stops coping.
 
-- [ ] `shakedown ramp --target URL --from 1 --to 200` — run a series of steps,
-      report latency and error rate per step
-- [ ] Detect the knee: the concurrency where throughput stops rising but latency
-      keeps climbing. That point is the service's real capacity
-- [ ] Warn when throughput is flat while latency grows linearly — the signature
-      of a saturated queue (Little's Law: `concurrency = throughput × latency`)
+- [x] `shakedown ramp --target URL --from 1 --to 200` — sweep concurrency
+      levels, report throughput, latency and error rate per step
+- [x] Geometric (doubling) levels, or an explicit `--levels` list
+- [x] Per-level warmup so a cold connection pool is not charged to the baseline
+- [x] Detect the knee: the concurrency at peak throughput is the real capacity
+- [x] Detect negative returns — throughput *falling* as load rises
+- [x] Report what share of a request is queueing rather than being served
+- [x] `--slo` to report the highest concurrency meeting a p99 budget
+- [ ] Open-model ramp: hold a fixed *arrival rate* per step rather than a fixed
+      worker count, which is what coordinated-omission correction needs
 
 ## Step 3: client-side resilience, and how it backfires
 
