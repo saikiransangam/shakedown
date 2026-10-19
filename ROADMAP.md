@@ -29,20 +29,28 @@ The useful question is where it stops coping.
 - [ ] Open-model ramp: hold a fixed *arrival rate* per step rather than a fixed
       worker count, which is what coordinated-omission correction needs
 
-## Step 3: client-side resilience, and how it backfires
+## Done — step 3: client-side resilience, and how it backfires
 
-The toolkit should let you test *policies*, not just endpoints.
+The toolkit tests *policies*, not just endpoints.
 
-- [ ] `retry` package: fixed / exponential backoff, with and without jitter
-- [ ] `--retries N --backoff exponential --jitter full` on `run`
-- [ ] Report retry amplification: requests sent vs. requests the caller made
-- [ ] Demonstrate the retry storm — show how naive retries against a brownout
-      multiply load and make recovery impossible, and how jitter and a retry
-      budget fix it
-- [ ] `breaker` package: closed → open → half-open state machine
-- [ ] `--breaker` on `run`, reporting time spent open and requests shed
-- [ ] Show that a breaker turns a slow failure into a fast one, which is the
-      entire point
+- [x] `retry` package: fixed / exponential backoff, none / full / equal jitter
+- [x] Retry budget — retries capped as a share of traffic, in fixed-point
+      arithmetic so small deposits do not drift
+- [x] `--retries N --backoff exponential --jitter full --retry-budget 0.1`
+- [x] Requests and attempts counted separately, so amplification is reported
+- [x] Caller-visible latency includes backoff waits, so the cost of retrying
+      is not hidden
+- [x] Only genuinely retryable outcomes are retried (never 4xx or TLS)
+- [x] `breaker` package: closed → open → half-open, rolling-window failure
+      ratio over a bucket ring, minimum sample size, limited half-open probes
+- [x] `--breaker` on `run`, reporting state, times opened, time open and shed
+- [x] Diagnosis rules for retry storms and breaker activity
+- [x] Demonstrated: retries hid a 12.1% error rate while making p99 30x worse;
+      naive retries amplified load 2.81x against a target already failing 90%;
+      a 10% budget cut that to 1.08x at a pinned arrival rate
+- [ ] Hedged requests: send a second attempt once p99 is exceeded rather than
+      waiting for failure, and show the latency/load tradeoff
+- [ ] Adaptive concurrency limit on the client side (AIMD / Netflix-style)
 
 ## Step 4: the fault-injecting proxy
 

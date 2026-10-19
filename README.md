@@ -25,6 +25,8 @@ before you point it at anything real.
 - [Quickstart](#quickstart)
 - [Commands](#commands)
 - [Architecture, end to end](#architecture-end-to-end)
+- [Retries, and the three ways they betray you](#retries-and-the-three-ways-they-betray-you)
+- [Circuit breakers turn slow failures into fast ones](#circuit-breakers-turn-slow-failures-into-fast-ones)
 - [Design decisions, and the problem each one avoids](#design-decisions-and-the-problem-each-one-avoids)
 - [Reading the output](#reading-the-output)
 - [Status](#status)
@@ -105,6 +107,19 @@ shakedown run --target URL [flags]
   --follow-redirects      follow 3xx
   --max-failure-rate R    exit non-zero above this failure rate (for CI)
   --quiet                 no live progress
+
+  client-side policies:
+  --retries N             max attempts per request (1 = off)
+  --backoff MODE          fixed | exponential
+  --jitter MODE           none | full | equal
+  --base-delay DURATION   first retry delay
+  --max-delay DURATION    cap on retry delay
+  --retry-budget R        cap retries at this share of traffic, e.g. 0.1
+  --breaker               enable a circuit breaker
+  --breaker-threshold R   failure ratio that opens it (default 0.5)
+  --breaker-min-requests N  minimum samples before it may open (default 20)
+  --breaker-window DUR    rolling window for the failure ratio
+  --breaker-cooldown DUR  how long to stay open before probing
 ```
 
 ### `ramp` — find the capacity limit
@@ -174,7 +189,14 @@ Four stages, each one a package that does not know how the next one works:
                      │    3. res := probe.Do(ctx)                    │
                      │    4. send res on the results channel         │
                      └──────────────────────┬───────────────────────┘
-                                            │ calls, once per request
+                                            │ once per LOGICAL request
+                                            ▼
+                                 ┌──────────────────────┐
+                                 │  resilience.Probe    │ optional: retry
+                                 │  retry + breaker     │ policy and breaker
+                                 └──────────┬───────────┘
+                                            │ may call the inner probe
+                                            │ many times, or not at all
                                             ▼
                                    ┌──────────────────┐
                                    │   probe.HTTP     │  one request:
@@ -211,6 +233,9 @@ Four stages, each one a package that does not know how the next one works:
 | `probe` | issuing one HTTP request and timing its phases | concurrency, aggregation |
 | `metrics` | the failure taxonomy, percentiles, per-second buckets | where results came from |
 | `ramp` | sweeping concurrency levels, finding the knee | HTTP, rendering |
+| `retry` | backoff, jitter, and the retry budget | what it is retrying |
+| `breaker` | the closed/open/half-open state machine | HTTP, retries |
+| `resilience` | wrapping a probe with those policies | both of their internals |
 | `internal/report` | diagnosis rules and terminal rendering | measurement |
 | `mockapi` | being a broken service on purpose | the client side entirely |
 
@@ -321,6 +346,113 @@ Because they are pure functions over a plain struct, the thresholds are
 testable without a server — which is what `ramp/ramp_test.go` does with
 synthetic steps.
 
+## Retries, and the three ways they betray you
+
+Retries are the most common well-intentioned cause of outages. The toolkit can
+demonstrate each failure mode on demand, because it reports what the *caller*
+experienced and what the *target absorbed* as two separate numbers.
+
+### 1. They hide errors by converting them into latency
+
+Against `--profile flaky` at 40 workers, with and without `--retries 3`:
+
+| | no retries | 3 attempts |
+|---|---|---|
+| failures | **12.1%** | **0.2%** |
+| p50 | 41ms | 45ms |
+| **p99** | **70ms** | **2.08s** |
+| tail ratio | 1.7x | **46x** |
+
+The error rate almost vanished, and that is real: retries genuinely rescued
+those requests. But the p99 got 30× worse, because a rescued request waited for
+a timeout *and* a backoff *and* another attempt. A dashboard watching error
+rates would call this a dramatic improvement. The callers waiting two seconds
+would disagree.
+
+This is why `resilience.Probe` reports latency from the caller's first attempt
+through the last, backoff included. Reporting only the final attempt's latency
+would hide exactly the cost that retries introduce.
+
+### 2. They multiply load precisely when the target has none to spare
+
+Against `--profile brownout` at 200 workers — a target failing ~90% of
+requests — naive retries turn 10,213 caller requests into **28,679 attempts**:
+
+```
+amplification        2.81x — 28,679 attempts for 10,213 requests
+
+! retry storm: 2.81x load against a target failing 89.6% of requests
+  ...This is self-sustaining — the retries cause the failures that
+  cause the retries.
+```
+
+A per-request cap of "3 attempts" sounds conservative, but when a target fails
+*every* request, every caller spends its full allowance at once. The limit does
+nothing in exactly the situation it was meant for.
+
+A **retry budget** fixes this by making retries a scarce shared resource: each
+request deposits a fraction of a token, each retry spends a whole one. Measured
+at a pinned arrival rate of 400/s, so both runs send the same traffic:
+
+| | no budget | `--retry-budget 0.1` |
+|---|---|---|
+| requests the caller made | 3,050 | 3,050 |
+| **attempts the target absorbed** | **5,253** | **3,305** |
+| amplification | 1.72x | **1.08x** |
+
+Note what the budget does *not* do: it does not improve this caller's success
+rate — it makes it worse, because fewer retries rescue fewer requests. A budget
+trades your own success rate for the health of a shared dependency. That makes
+it a system-level decision, not a per-client one.
+
+> Pinning `--rate` for that comparison was not optional. Measured without it,
+> the budgeted run looked *worse* — denying retries freed the workers to send
+> far more requests, so total attempts went up. See
+> [why unthrottled runs can mislead you](#why-unthrottled-runs-can-mislead-you).
+
+### 3. They retry things that cannot succeed
+
+A 4xx will be a 4xx next time. A bad certificate will not repair itself.
+`metrics.Outcome.Retryable()` is the list of failures a retry could plausibly
+fix — timeouts, resets, refused connections, 5xx, DNS — and nothing else.
+
+## Circuit breakers turn slow failures into fast ones
+
+A breaker does not reduce errors. A shed request is still a failed request. Its
+job is to stop a caller from *waiting* on something known to be broken, because
+a caller blocked for five seconds is holding a connection, a goroutine and
+often a lock for five seconds — and thousands of those are how one sick
+dependency takes down everything upstream of it.
+
+```
+Client policies
+  breaker              closed now, opened 4 time(s), 4.01s spent open
+  shed                 1,618 requests never sent
+```
+
+The effect shows up in the latency line for *all* requests rather than only
+successful ones:
+
+```
+including failures:  p50 236us   p99 1.15s
+```
+
+A median request of 236 **microseconds** — because a shed request returns
+immediately instead of burning the full timeout. That number is the entire
+value proposition.
+
+The state machine is the classic three states, with two details that matter:
+
+- **`MinRequests` before it may open.** Without a minimum sample size, the
+  first two requests failing is a 100% failure rate and the breaker trips on
+  noise.
+- **Only `ServerFault()` outcomes count.** Tripping on 4xx would let one
+  caller's malformed requests cut off every other caller.
+
+A half-open breaker admits exactly `HalfOpenProbes` requests and sheds the
+rest, so the recovery probe cannot itself become the load spike that knocks the
+target back over. One failed probe re-opens it immediately.
+
 ## Design decisions, and the problem each one avoids
 
 Each of these is a line of code that looks arbitrary until you know what goes
@@ -396,7 +528,20 @@ comes from.
 You asked to measure a specific endpoint. Following a 302 silently measures a
 different one.
 
-#### 11. No third-party dependencies
+#### 11. Requests and attempts are counted separately
+
+`Summary.Total` is what the caller asked for; `Summary.Attempts` is what went
+on the wire. Collapsing them into one number would make retry amplification
+invisible, which is the single most useful thing to know about a retry policy.
+
+#### 12. The retry budget uses fixed-point arithmetic
+
+Adding `0.1` to a float a hundred times gives 9.999…, so a budget that should
+have granted ten retries grants nine. The accounting is in millionths of a
+token as `int64` instead. A test caught this, which is the argument for testing
+arithmetic that looks too simple to break.
+
+#### 13. No third-party dependencies
 
 Standard library `flag` instead of a CLI framework, no metrics library, no
 assertion library. It keeps the build instant and the supply chain empty, and
@@ -416,6 +561,7 @@ something that already does it would defeat the point.
 | `client_error` | 4xx: usually the request is wrong, so the run is not measuring the happy path |
 | `dns_failure` / `tls_failure` | the request never got as far as the application |
 | `canceled` | we gave up, not the server |
+| `circuit_open` | never sent — our own breaker shed it |
 
 **Where the time went** — a request is not one latency number. If TTFB
 dominates, the server is thinking and you should profile the handler. If
@@ -454,9 +600,10 @@ service behaves at a *specific* load, set `--rate`.
 
 ## Status
 
-Early, and honest about it: the load driver, the concurrency sweep, and the
-fault-injecting mock server work today. Retries, circuit breakers and the
-fault-injecting proxy are next — see [ROADMAP.md](ROADMAP.md).
+Early, and honest about it. Working today: the load driver, the concurrency
+sweep, retry policies with budgets, a circuit breaker, and the fault-injecting
+mock server. The fault-injecting *proxy* — breaking a service you did not write
+— is next, see [ROADMAP.md](ROADMAP.md).
 
 ## Development
 

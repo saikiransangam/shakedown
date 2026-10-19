@@ -7,13 +7,25 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/saikiransangam/shakedown/breaker"
 	"github.com/saikiransangam/shakedown/metrics"
 )
 
 const lineWidth = 72
 
+// PolicyInfo describes the client-side policies a run was configured with, so
+// the report can show what the caller was doing as well as what the target
+// did. Nil when no policies were in play.
+type PolicyInfo struct {
+	MaxAttempts int
+	Strategy    string
+	Jitter      string
+	BudgetRatio float64
+	Breaker     *breaker.Stats
+}
+
 // Text writes a human-readable report for a finished run.
-func Text(w io.Writer, s *metrics.Summary) {
+func Text(w io.Writer, s *metrics.Summary, policy *PolicyInfo) {
 	st := style{}
 	if f, ok := w.(*os.File); ok {
 		st = newStyle(f)
@@ -29,7 +41,46 @@ func Text(w io.Writer, s *metrics.Summary) {
 	writeLatency(w, st, s)
 	writePhases(w, st, s)
 	writeTimeline(w, st, s)
+	writePolicy(w, st, s, policy)
 	writeFindings(w, st, Diagnose(s))
+}
+
+func writePolicy(w io.Writer, st style, s *metrics.Summary, p *PolicyInfo) {
+	if p == nil {
+		return
+	}
+
+	fmt.Fprintf(w, "\n%s\n", st.bold("Client policies"))
+
+	if p.MaxAttempts > 1 {
+		budget := "none"
+		if p.BudgetRatio > 0 {
+			budget = Pct(p.BudgetRatio)
+		}
+		fmt.Fprintf(w, "  %s up to %d attempts, %s backoff, %s jitter, budget %s\n",
+			Pad(st.dim("retry"), 20), p.MaxAttempts, p.Strategy, p.Jitter, budget)
+
+		amp := s.Amplification()
+		text := fmt.Sprintf("%.2fx — %s attempts for %s requests",
+			amp, Count(s.Attempts), Count(s.Total))
+		switch {
+		case amp >= 2:
+			text = st.red(text)
+		case amp >= 1.2:
+			text = st.amber(text)
+		}
+		fmt.Fprintf(w, "  %s %s\n", Pad(st.dim("amplification"), 20), text)
+	}
+
+	if p.Breaker != nil {
+		b := p.Breaker
+		fmt.Fprintf(w, "  %s %s now, opened %d time(s), %s spent open\n",
+			Pad(st.dim("breaker"), 20), b.State, b.TimesOpened, Dur(b.TimeOpen))
+		if b.Shed > 0 {
+			fmt.Fprintf(w, "  %s %s requests never sent\n",
+				Pad(st.dim("shed"), 20), Count(int(b.Shed)))
+		}
+	}
 }
 
 func writeOverview(w io.Writer, st style, s *metrics.Summary) {

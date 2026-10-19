@@ -27,7 +27,8 @@ const (
 	OutcomeConnReset   Outcome = "conn_reset"   // connection died mid-flight
 	OutcomeDNSFailure  Outcome = "dns_failure"
 	OutcomeTLSFailure  Outcome = "tls_failure"
-	OutcomeCanceled    Outcome = "canceled" // we gave up, not the server
+	OutcomeCanceled    Outcome = "canceled"     // we gave up, not the server
+	OutcomeCircuitOpen Outcome = "circuit_open" // never sent: our own breaker shed it
 	OutcomeUnknown     Outcome = "unknown"
 )
 
@@ -43,6 +44,7 @@ func AllOutcomes() []Outcome {
 		OutcomeConnRefused,
 		OutcomeDNSFailure,
 		OutcomeTLSFailure,
+		OutcomeCircuitOpen,
 		OutcomeCanceled,
 		OutcomeUnknown,
 	}
@@ -50,6 +52,36 @@ func AllOutcomes() []Outcome {
 
 // OK reports whether the outcome counts as a successful request.
 func (o Outcome) OK() bool { return o == OutcomeSuccess }
+
+// Retryable reports whether a retry could plausibly fix this failure.
+//
+// A 4xx will return 4xx again, and a bad certificate will not repair itself,
+// so retrying those only multiplies load for nothing. This distinction is what
+// separates a retry policy from a denial-of-service attack on your own
+// dependency.
+func (o Outcome) Retryable() bool {
+	switch o {
+	case OutcomeTimeout, OutcomeConnReset, OutcomeConnRefused,
+		OutcomeServerError, OutcomeDNSFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+// ServerFault reports whether the outcome says the target is unhealthy, as
+// opposed to the request being wrong or the caller giving up. A circuit
+// breaker must only count these: tripping on 4xx would let one caller's bad
+// request cut off everyone else.
+func (o Outcome) ServerFault() bool {
+	switch o {
+	case OutcomeTimeout, OutcomeConnReset, OutcomeConnRefused,
+		OutcomeServerError, OutcomeDNSFailure, OutcomeTLSFailure:
+		return true
+	default:
+		return false
+	}
+}
 
 // Classify turns an HTTP status and/or transport error into an Outcome.
 //
