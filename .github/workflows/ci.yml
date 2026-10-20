@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          # The project has no third-party dependencies, so there is nothing
+          # worth caching and a stale cache would only hide problems.
+          cache: false
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # This project is about concurrency, so a data race is a correctness bug
+      # and not a flake to be retried.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: go build ./...
+
+  # The tool's own output is part of what it promises, so exercise the real
+  # binary against the mock server rather than only unit-testing the pieces.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - run: go build -o shakedown ./cmd/shakedown
+
+      - name: Run against the mock API
+        run: |
+          ./shakedown mock --profile flaky --listen 127.0.0.1:9090 &
+          mock_pid=$!
+          trap 'kill $mock_pid 2>/dev/null || true' EXIT
+
+          # Wait for the listener. `run` exits 0 even when every request
+          # fails unless a failure budget is set, so it is not a readiness
+          # check — ask for the response itself.
+          for _ in $(seq 1 40); do
+            curl -fsS -o /dev/null http://127.0.0.1:9090/healthz 2>/dev/null && break
+            sleep 0.25
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:9090/healthz
+
+          ./shakedown run --target http://127.0.0.1:9090/orders -c 20 -d 5s --timeout 2s --quiet
+          ./shakedown run --target http://127.0.0.1:9090/orders -c 20 -d 5s --timeout 2s --quiet \
+            --retries 3 --retry-budget 0.1 --breaker
+          ./shakedown ramp --target http://127.0.0.1:9090/orders \
+            --levels 1,4,16 --step-duration 2s --warmup 500ms --slo 200ms
+
+      - name: Failure budget gating exits non-zero
+        run: |
+          ./shakedown mock --profile tarpit --listen 127.0.0.1:9091 &
+          mock_pid=$!
+          trap 'kill $mock_pid 2>/dev/null || true' EXIT
+          sleep 1
+
+          # Everything fails against a tarpit, so --max-failure-rate must
+          # reject the run. A zero exit here would mean CI gating is broken.
+          if ./shakedown run --target http://127.0.0.1:9091/orders \
+               -c 5 -d 3s --timeout 500ms --quiet --max-failure-rate 0.1; then
+            echo "expected a non-zero exit from the failure budget"
+            exit 1
+          fi

@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/saikiransangam/shakedown/metrics"
@@ -24,13 +25,15 @@ type Finding struct {
 }
 
 const (
-	tailRatioThreshold    = 10.0
-	timeoutRateThreshold  = 0.01
-	errorRateThreshold    = 0.01
-	driftRatioThreshold   = 2.0
-	serverBoundTTFBShare  = 0.8
-	slowConnectThreshold  = 50 * time.Millisecond
-	lowReuseRateThreshold = 0.5
+	tailRatioThreshold     = 10.0
+	timeoutRateThreshold   = 0.01
+	errorRateThreshold     = 0.01
+	driftRatioThreshold    = 2.0
+	serverBoundTTFBShare   = 0.8
+	slowConnectThreshold   = 50 * time.Millisecond
+	lowReuseRateThreshold  = 0.5
+	amplificationThreshold = 1.2
+	retryStormFailureRate  = 0.25
 )
 
 // Diagnose turns a summary into findings, ordered most severe first.
@@ -50,6 +53,7 @@ func Diagnose(s *metrics.Summary) []Finding {
 	findings = append(findings, diagnoseLatency(s)...)
 	findings = append(findings, diagnoseDrift(s)...)
 	findings = append(findings, diagnosePhases(s)...)
+	findings = append(findings, diagnosePolicies(s)...)
 
 	if len(findings) == 0 {
 		findings = append(findings, Finding{
@@ -59,7 +63,22 @@ func Diagnose(s *metrics.Summary) []Finding {
 				"or inject faults with `shakedown mock --profile brownout` to see what failure looks like.", s.Concurrency),
 		})
 	}
+
+	SortFindings(findings)
 	return findings
+}
+
+// SortFindings orders findings most severe first, preserving the order rules
+// ran in within a severity.
+//
+// The ordering has to be applied to the data rather than left to the renderer:
+// the rules run in a fixed sequence that has nothing to do with how serious
+// their findings turn out to be, so a severe conclusion from a late rule would
+// otherwise be buried under a mild one from an early rule.
+func SortFindings(findings []Finding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		return findings[i].Severity > findings[j].Severity
+	})
 }
 
 func diagnoseConnectivity(s *metrics.Summary) []Finding {
@@ -210,6 +229,45 @@ func diagnosePhases(s *metrics.Summary) []Finding {
 			Severity: SeverityWarn,
 			Title:    fmt.Sprintf("only %s of requests reused a connection", Pct(s.ReuseRate())),
 			Detail:   "Most requests paid for a new TCP (and TLS) handshake. Either the server is closing connections (Connection: close, or a short idle timeout) or the client pool is too small for this concurrency.",
+		})
+	}
+
+	return out
+}
+
+func diagnosePolicies(s *metrics.Summary) []Finding {
+	var out []Finding
+
+	amp := s.Amplification()
+	if amp >= amplificationThreshold {
+		extra := s.Attempts - s.Total
+		finding := Finding{
+			Severity: SeverityWarn,
+			Title:    fmt.Sprintf("retries amplified load %.2fx (%s extra attempts)", amp, Count(extra)),
+			Detail: "Retries are doing their job, but note that the target absorbed more traffic than this " +
+				"run's request count suggests. Size capacity against attempts, not requests.",
+		}
+		// Retrying into a target that is failing most requests is the classic
+		// retry storm: the extra load is the reason it cannot recover.
+		if s.FailureRate() > retryStormFailureRate {
+			finding.Severity = SeverityBad
+			finding.Title = fmt.Sprintf("retry storm: %.2fx load against a target failing %s of requests",
+				amp, Pct(s.FailureRate()))
+			finding.Detail = "The target is failing and every failure is being retried, so it is receiving " +
+				"several times its normal load precisely when it has least capacity. This is self-sustaining — " +
+				"the retries cause the failures that cause the retries. A retry budget (--retry-budget 0.1) caps " +
+				"retries as a share of traffic, so a broad outage stops being retried instead of being amplified."
+		}
+		out = append(out, finding)
+	}
+
+	if shed := s.Outcomes[metrics.OutcomeCircuitOpen]; shed > 0 {
+		out = append(out, Finding{
+			Severity: SeverityInfo,
+			Title:    fmt.Sprintf("the circuit breaker shed %s requests (%s)", Count(shed), Pct(s.Rate(metrics.OutcomeCircuitOpen))),
+			Detail: "Those requests failed instantly instead of waiting for a timeout. They are still failures, " +
+				"but a caller that fails in microseconds is not holding connections and goroutines open — which " +
+				"is what stops one sick dependency from taking its callers down with it.",
 		})
 	}
 
