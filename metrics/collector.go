@@ -31,7 +31,11 @@ type Summary struct {
 	End         time.Time
 	Interrupted bool
 
+	// Total is the number of requests the caller made. Attempts is the number
+	// actually put on the wire, which is larger when a retry policy is in
+	// play — the gap between them is the load retries add to the target.
 	Total    int
+	Attempts int
 	Outcomes map[Outcome]int
 	Statuses map[int]int
 
@@ -84,6 +88,16 @@ func (s *Summary) Rate(o Outcome) float64 {
 	return float64(s.Outcomes[o]) / float64(s.Total)
 }
 
+// Amplification is attempts sent per request the caller made. 1.0 means no
+// retries happened; 3.0 means the target absorbed three times the traffic the
+// caller believes it sent.
+func (s *Summary) Amplification() float64 {
+	if s.Total == 0 {
+		return 0
+	}
+	return float64(s.Attempts) / float64(s.Total)
+}
+
 func (s *Summary) ReuseRate() float64 {
 	if s.Total == 0 {
 		return 0
@@ -121,9 +135,10 @@ type Collector struct {
 	ttfb    []time.Duration
 	body    []time.Duration
 
-	reused  int
-	bytes   int64
-	buckets map[int]*bucketAcc
+	reused   int
+	attempts int
+	bytes    int64
+	buckets  map[int]*bucketAcc
 }
 
 func NewCollector(start time.Time) *Collector {
@@ -162,6 +177,7 @@ func (c *Collector) add(r Result) {
 	if r.Status != 0 {
 		c.statuses[r.Status]++
 	}
+	c.attempts += r.Attempts
 	c.all = append(c.all, r.Latency)
 	if r.Outcome.OK() {
 		c.success = append(c.success, r.Latency)
@@ -219,6 +235,7 @@ func (c *Collector) summary() *Summary {
 		Start:    c.start,
 		End:      end,
 		Total:    len(c.all),
+		Attempts: c.attempts,
 		Outcomes: c.outcomes,
 		Statuses: c.statuses,
 		Success:  NewDistribution(c.success),

@@ -1,6 +1,6 @@
 BINARY := shakedown
 
-.PHONY: build test fmt vet check clean demo
+.PHONY: build test fmt vet check cover clean demo
 
 build:
 	go build -o $(BINARY) ./cmd/shakedown
@@ -15,6 +15,9 @@ vet:
 	go vet ./...
 
 check: fmt vet test
+
+cover:
+	go test -cover ./...
 
 clean:
 	rm -f $(BINARY)

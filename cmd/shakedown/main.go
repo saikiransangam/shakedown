@@ -31,6 +31,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		code, err = cli.Run(ctx, os.Args[2:])
+	case "ramp":
+		code, err = cli.Ramp(ctx, os.Args[2:])
 	case "mock":
 		code, err = cli.Mock(ctx, os.Args[2:])
 	case "version", "--version", "-v":

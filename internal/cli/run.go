@@ -8,10 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/saikiransangam/shakedown/breaker"
 	"github.com/saikiransangam/shakedown/internal/report"
 	"github.com/saikiransangam/shakedown/load"
 	"github.com/saikiransangam/shakedown/metrics"
 	"github.com/saikiransangam/shakedown/probe"
+	"github.com/saikiransangam/shakedown/resilience"
+	"github.com/saikiransangam/shakedown/retry"
 )
 
 // Run executes the `shakedown run` subcommand. It returns the process exit
@@ -37,6 +40,19 @@ func Run(ctx context.Context, args []string) (int, error) {
 		redirects   = fs.Bool("follow-redirects", false, "follow 3xx redirects")
 		maxFailRate = fs.Float64("max-failure-rate", -1, "exit non-zero if the failure rate exceeds this (0..1)")
 		quiet       = fs.Bool("quiet", false, "suppress live progress output")
+
+		retries     = fs.Int("retries", 1, "max attempts per request (1 = no retries)")
+		backoff     = fs.String("backoff", "exponential", "backoff strategy: fixed or exponential")
+		jitter      = fs.String("jitter", "full", "jitter mode: none, full or equal")
+		baseDelay   = fs.Duration("base-delay", 50*time.Millisecond, "first retry delay")
+		maxDelay    = fs.Duration("max-delay", 2*time.Second, "cap on retry delay")
+		retryBudget = fs.Float64("retry-budget", 0, "cap retries at this share of traffic (0 = uncapped)")
+
+		useBreaker       = fs.Bool("breaker", false, "enable a circuit breaker")
+		breakerThreshold = fs.Float64("breaker-threshold", 0.5, "failure ratio that opens the breaker")
+		breakerMin       = fs.Int("breaker-min-requests", 20, "minimum requests in the window before it can open")
+		breakerWindow    = fs.Duration("breaker-window", 10*time.Second, "rolling window for the failure ratio")
+		breakerCooldown  = fs.Duration("breaker-cooldown", 2*time.Second, "how long to stay open before probing")
 	)
 	headers := &headerFlag{}
 	fs.Var(headers, "H", "request header in 'Name: value' form (repeatable)")
@@ -64,6 +80,49 @@ func Run(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 
+	var probeUnderTest load.Probe = httpProbe
+	var policyInfo *report.PolicyInfo
+	var circuitBreaker *breaker.Breaker
+
+	if *retries > 1 || *useBreaker {
+		strategy, err := retry.ParseStrategy(*backoff)
+		if err != nil {
+			return 2, err
+		}
+		jitterMode, err := retry.ParseJitter(*jitter)
+		if err != nil {
+			return 2, err
+		}
+
+		policy := retry.Policy{
+			MaxAttempts: *retries,
+			BaseDelay:   *baseDelay,
+			MaxDelay:    *maxDelay,
+			Strategy:    strategy,
+			Jitter:      jitterMode,
+		}
+		if *retryBudget > 0 {
+			policy.Budget = retry.NewBudget(*retryBudget)
+		}
+
+		if *useBreaker {
+			circuitBreaker = breaker.New(breaker.Config{
+				FailureThreshold: *breakerThreshold,
+				MinRequests:      *breakerMin,
+				Window:           *breakerWindow,
+				Cooldown:         *breakerCooldown,
+			})
+		}
+
+		probeUnderTest = resilience.Wrap(httpProbe, policy, circuitBreaker)
+		policyInfo = &report.PolicyInfo{
+			MaxAttempts: *retries,
+			Strategy:    string(strategy),
+			Jitter:      string(jitterMode),
+			BudgetRatio: *retryBudget,
+		}
+	}
+
 	cfg := load.Config{
 		Concurrency: *concurrency,
 		Duration:    *duration,
@@ -83,13 +142,18 @@ func Run(ctx context.Context, args []string) (int, error) {
 	}
 	fmt.Fprintf(os.Stderr, "running %s against %s (timeout %s)\n", plan, *target, *timeout)
 
-	summary := load.Run(ctx, cfg, httpProbe)
+	summary := load.Run(ctx, cfg, probeUnderTest)
 	summary.Target = *target
+
+	if circuitBreaker != nil {
+		stats := circuitBreaker.Stats()
+		policyInfo.Breaker = &stats
+	}
 
 	if showProgress {
 		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", 60))
 	}
-	report.Text(os.Stdout, summary)
+	report.Text(os.Stdout, summary, policyInfo)
 
 	if *maxFailRate >= 0 && summary.FailureRate() > *maxFailRate {
 		fmt.Fprintf(os.Stderr, "failure rate %.2f%% exceeds budget %.2f%%\n",
